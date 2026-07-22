@@ -5,6 +5,82 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import numpy as np
 import config
+from pydantic import BaseModel
+from typing import List
+import json
+import anthropic
+
+app = FastAPI()
+
+# Rule 4: handle CORS so any frontend/tester can call your API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client = anthropic.Anthropic(api_key="YOUR_API_KEY")
+
+class Chunk(BaseModel):
+    chunk_id: str
+    text: str
+
+class QARequest(BaseModel):
+    question: str
+    chunks: List[Chunk]
+
+@app.post("/grounded-qa")
+async def grounded_qa(payload: QARequest):
+    # Handle malformed / empty inputs gracefully (Rule 4)
+    if not payload.question or not payload.chunks:
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False
+        }
+
+    chunks_text = "\n".join(
+        f"[{c.chunk_id}]: {c.text}" for c in payload.chunks
+    )
+    valid_ids = {c.chunk_id for c in payload.chunks}
+
+    prompt = GROUNDED_PROMPT.format(
+        chunks_text=chunks_text,
+        question=payload.question
+    )
+
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw_text = response.content[0].text.strip()
+        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw_text)
+    except Exception:
+        # If anything breaks, fail safe instead of crashing
+        return {
+            "answer": "I don't know",
+            "citations": [],
+            "confidence": 0.0,
+            "answerable": False
+        }
+
+    # Rule 3: strip out any hallucinated chunk IDs the model made up
+    result["citations"] = [
+        cid for cid in result.get("citations", []) if cid in valid_ids
+    ]
+
+    # Rule 1: enforce the unanswerable format no matter what the model said
+    if not result.get("answerable", False):
+        result["answer"] = "I don't know"
+        result["citations"] = []
+        result["confidence"] = min(result.get("confidence", 0.0), 0.3)
+
+    return result
 
 # ============================================================
 # Seedrandom (David Bau ARC4 PRNG) — Python port

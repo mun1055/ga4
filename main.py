@@ -5,82 +5,6 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import numpy as np
 import config
-from pydantic import BaseModel
-from typing import List
-import json
-import anthropic
-
-app = FastAPI()
-
-# Rule 4: handle CORS so any frontend/tester can call your API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-client = anthropic.Anthropic(api_key="YOUR_API_KEY")
-
-class Chunk(BaseModel):
-    chunk_id: str
-    text: str
-
-class QARequest(BaseModel):
-    question: str
-    chunks: List[Chunk]
-
-@app.post("/grounded-qa")
-async def grounded_qa(payload: QARequest):
-    # Handle malformed / empty inputs gracefully (Rule 4)
-    if not payload.question or not payload.chunks:
-        return {
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.0,
-            "answerable": False
-        }
-
-    chunks_text = "\n".join(
-        f"[{c.chunk_id}]: {c.text}" for c in payload.chunks
-    )
-    valid_ids = {c.chunk_id for c in payload.chunks}
-
-    prompt = GROUNDED_PROMPT.format(
-        chunks_text=chunks_text,
-        question=payload.question
-    )
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw_text = response.content[0].text.strip()
-        raw_text = raw_text.replace("```json", "").replace("```", "").strip()
-        result = json.loads(raw_text)
-    except Exception:
-        # If anything breaks, fail safe instead of crashing
-        return {
-            "answer": "I don't know",
-            "citations": [],
-            "confidence": 0.0,
-            "answerable": False
-        }
-
-    # Rule 3: strip out any hallucinated chunk IDs the model made up
-    result["citations"] = [
-        cid for cid in result.get("citations", []) if cid in valid_ids
-    ]
-
-    # Rule 1: enforce the unanswerable format no matter what the model said
-    if not result.get("answerable", False):
-        result["answer"] = "I don't know"
-        result["citations"] = []
-        result["confidence"] = min(result.get("confidence", 0.0), 0.3)
-
-    return result
 
 # ============================================================
 # Seedrandom (David Bau ARC4 PRNG) — Python port
@@ -273,42 +197,70 @@ async def root():
     return {"ok": True, "email": config.EMAIL}
 
 # ================= Q3: /q3/answer =================
+FALLBACK = {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
-    body = await request.json()
+    # Fix #1: parse body defensively — malformed JSON must not 500
+    try:
+        body = await request.json()
+    except Exception:
+        return FALLBACK
+
     question = body.get("question", "")
     chunks = body.get("chunks", [])
+
+    # Fix: empty/invalid input handled gracefully, no LLM call needed
+    if not isinstance(question, str) or not question.strip() or not isinstance(chunks, list) or not chunks:
+        return FALLBACK
+
+    valid_ids = [c.get("chunk_id") for c in chunks if isinstance(c, dict) and "chunk_id" in c]
+    if not valid_ids:
+        return FALLBACK
+
     prompt = (
         "You are a highly reliable Grounded QA API for medical and legal compliance.\n"
-        "Your task is to answer the user's question strictly using ONLY the provided context chunks.\n"
-        "1. If the question CANNOT be answered from the chunks, you MUST return:\n"
-        "   - answerable: false\n"
-        "   - answer: \"I don't know\" (exact match)\n"
-        "   - citations: [] (empty array)\n"
-        "   - confidence: 0.1\n"
+        "Answer the user's question strictly using ONLY the provided context chunks.\n"
+        "1. If the question CANNOT be answered from the chunks, return:\n"
+        "   answerable: false, answer: \"I don't know\", citations: [], confidence: 0.1\n"
         "2. If it CAN be answered, return:\n"
-        "   - answerable: true\n"
-        "   - answer: <your grounded answer>\n"
-        "   - citations: [<list of ONLY the chunk_ids you used>]\n"
-        "   - confidence: <float between 0.8 and 1.0>\n"
+        "   answerable: true, answer: <grounded answer>, citations: [<only chunk_ids used>],\n"
+        "   confidence: <float between 0.8 and 1.0>\n"
         "NEVER use outside knowledge. Return strictly JSON with exactly these 4 keys.\n\n"
         f"QUESTION:\n{question}\n\n"
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
+
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
-        if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
-        return {
-            "answer": out.get("answer", "I don't know"),
-            "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
-            "answerable": True
-        }
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000)
+        out = parse_json(raw)
     except Exception:
-        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        # Fix #2/#3: proxy/model failure -> fail safe, don't 500, don't hang
+        return FALLBACK
+
+    # Fix #4: clamp/validate confidence instead of blindly trusting the model
+    try:
+        confidence = float(out.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+
+    if not out.get("answerable", False) or confidence <= 0.3:
+        return {"answer": "I don't know", "citations": [], "confidence": min(confidence, 0.3), "answerable": False}
+
+    # Fix #3 (continued): only allow real, provided chunk IDs — no hallucinated citations
+    cites = [c for c in out.get("citations", []) if c in valid_ids]
+
+    answer = out.get("answer", "I don't know")
+    if not isinstance(answer, str) or not answer.strip():
+        return FALLBACK
+
+    return {
+        "answer": answer,
+        "citations": cites,
+        "confidence": confidence,
+        "answerable": True
+    }
 
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
